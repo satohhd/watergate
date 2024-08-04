@@ -3,7 +3,8 @@
 #######################################################
 
 #必要なライブラリのインポート
-from machine import SoftI2C, Pin, RTC
+import uasyncio as asyncio
+from machine import SoftI2C, Pin, RTC, reset
 from ds1307 import DS1307
 import utime
 import json
@@ -30,7 +31,6 @@ TRIG = Pin(15,Pin.OUT)
 
 # Create a Bluetooth Low Energy (BLE) object
 BLE = bluetooth.BLE()
-
 # Create an instance of the BLESimplePeripheral class with the BLE object
 BLE_SP = BLESimplePeripheral(BLE)
 
@@ -41,8 +41,7 @@ BLE_SP = BLESimplePeripheral(BLE)
 CONFIG_JSON_FILE = '/config.json'
 OPE_TIME_JSON_FILE = '/operation_time.json' 
 LOG_FILE = '/operation.log'
-#AUTOSELF_AUTO = 0
-#AUTOSELF_SELF = 1
+
 OPENCLOSE_OPEN = 0
 OPENCLOSE_CLOSE = 1
 FORCE_OPEN_ON = 0
@@ -54,33 +53,40 @@ FORCE_CLOSE_OFF = 1
 #######################################################
 # 変数
 #######################################################
-g_ble_ope_mode = "show"
+g_water_level = 0
+g_is_drive_times = False
+g_open_close = OPENCLOSE_OPEN #電源いれたときに一度閉じるため
+g_count_down_since_opening = 0
+#g_ble_ope_mode = "show"
+g_ble_ope_mode = None
 g_ble_commands = []
 g_config_dic = {
                 "water_level_correction_mm": 50, \
                 "waiting_for_interval_sec": 5, \
                 "open_closing_standards_mm": 7, \
-                "distance_correction": 3, \
-                "open_time_sec": 25, \
-                "close_time_sec": 40, \
+                "open_time_sec": 50, \
+                "close_time_sec": 80, \
                 "ope_time_1": False, \
                 "ope_time_2": True, \
                 "ope_time_3": False, \
                 "ope_time_4": False, \
-                "ope_time_5": False, \
-                "ope_time_6": False \
+                "ope_time_5": True, \
+                "ope_time_6": False, \
+                "ope_time_7": True, \
+                "ope_time_8": False \
             }
 
 g_ope_time_dic = [ \
-                    {"id": 1,"start_time": "00:00", "end_time": "04:00" }, \
-                    {"id": 2,"start_time": "04:00", "end_time": "08:00" }, \
-                    {"id": 3,"start_time": "08:00", "end_time": "12:00" }, \
-                    {"id": 4,"start_time": "12:00", "end_time": "16:00" }, \
-                    {"id": 5,"start_time": "16:00", "end_time": "20:00" }, \
-                    {"id": 6,"start_time": "20:00", "end_time": "24:00" } \
+                    {"id": 1,"start_time": "00:00", "end_time": "03:00" }, \
+                    {"id": 2,"start_time": "03:00", "end_time": "06:00" }, \
+                    {"id": 3,"start_time": "06:00", "end_time": "09:00" }, \
+                    {"id": 4,"start_time": "09:00", "end_time": "12:00" }, \
+                    {"id": 5,"start_time": "12:00", "end_time": "15:00" }, \
+                    {"id": 6,"start_time": "15:00", "end_time": "18:00" }, \
+                    {"id": 7,"start_time": "18:00", "end_time": "21:00" }, \
+                    {"id": 8,"start_time": "21:00", "end_time": "24:00" } \
                 ]
 
-g_count_down_since_opening = 0
 #######################################################
 #関数ログ出力関数定義
 #######################################################
@@ -90,26 +96,120 @@ def logger(msg):
         _dateTime = fromatDateTimeStr(utime.localtime())
 
         formated_msg = _dateTime + ' ' + msg + '\n'
-        if BLE_SP.is_connected():
-            if g_ble_ope_mode == 'log':
-                BLE_SP.send(formated_msg)
+        #if BLE_SP.is_connected():
+            #if g_ble_ope_mode == 'log':
+        #    BLE_SP.send(formated_msg.strip())
 
-        with open(LOG_FILE, 'a') as f:  # ファイルを追記モードで開く
-            f.write(formated_msg)    # 追記実行（文字列で）※改行付
+        #with open(LOG_FILE, 'a') as f:  # ファイルを追記モードで開く
+            #f.write(formated_msg)    # 追記実行（文字列で）※改行付
             #print("Append:", data)  # 追記データ表示
 
         print(formated_msg.strip())
     except Exception as e:
         print('logger error:' + str(e))
-        with open(LOG_FILE, 'w') as f:  # ファイルを追記モードで開く
-            f.write(formated_msg)    # 追記実行（文字列で）※改行付
+        #with open(LOG_FILE, 'w') as f:  # ファイルを追記モードで開く
+        #    f.write(formated_msg)    # 追記実行（文字列で）※改行付
             #print("Append:", data)  # 追記データ表示
+
+#######################################################
+# 状態表示定義
+#######################################################
+def show_status():
+    #global g_config_dic
+    #logger('11111')
+    (_today,_current_time) = getDateTime(utime.localtime())
+    #logger('211111')
+    #if BLE_SP.is_connected():
+    #logger('311111')
+    formated_msg = '現在水位' + str(round(g_config_dic['water_level_correction_mm'] - g_water_level,1)) + 'cm ' \
+           + '閾値' + str(g_config_dic['open_closing_standards_mm']) + 'cm' \
+           + ' ' + ('強制' if g_ble_ope_mode == 'force' else '自動' if g_ble_ope_mode == 'auto' else '手動') \
+           + ' ' + ('開門' if g_open_close == OPENCLOSE_OPEN else '閉門') \
+           + ' ' + ('運中帯' if g_is_drive_times ==True else '運止帯') \
+           + ' ' + str(_current_time)
+    #logger('411111')
+    BLE_SP.send(formated_msg.strip())
+    #logger('511111')
+    logger(formated_msg.strip())
+    #logger('611111')
+
+#######################################################
+# rtc
+#######################################################
+def set_rtc():
+
+    #RTCから時刻取得
+    logger('rtc connect')
+    _i2c_rtc = SoftI2C(scl = Pin(1),sda = Pin(0),freq = 100000)
+    _result = SoftI2C.scan(_i2c_rtc)
+    _rtc = DS1307(_i2c_rtc)
+    #時間設定
+    #utime.localtime()
+    logger('datetime setting')
+    RTC().datetime(_rtc.datetime())
+
+
+#######################################################
+# load_config
+#######################################################
+def load_config():
+    global g_config_dic
+    global g_ope_time_dic
+
+    #初期設定情報の読み込み
+    logger('config load')
+    try:
+
+        # 設定ファイルの読み込み
+        with open(CONFIG_JSON_FILE, 'r') as f:
+            g_config_dic = json.load(f)
+
+    except OSError:  # ファイルが存在しない場合のエラーハンドリング
+        # 設定ファイルの書き込み
+        with open(CONFIG_JSON_FILE, 'w') as f:
+            json.dump(g_config_dic,f, separators=(',', ': '))
+
+    try:
+
+        # 運用時間ファイルの読み込み
+        with open(OPE_TIME_JSON_FILE, 'r') as f:
+            g_ope_time_dic = json.load(f)
+
+    except OSError:  # ファイルが存在しない場合のエラーハンドリング
+
+        # 運用時間ファイルの書き込み
+        with open(OPE_TIME_JSON_FILE, 'w') as f:
+            json.dump(g_ope_time_dic,f, separators=(',', ': '))
+
+
+#######################################################
+# 運用時間チェック
+#######################################################
+async def check_drive_times():
+    global g_is_drive_times
+    #無限ループ
+    while True:
+        (_today,_current_time) = getDateTime(utime.localtime())
+        #③運用時間帯チェック
+        logger('運用時間帯チェック')
+        g_is_drive_times = False
+        for item in g_ope_time_dic:
+            #print(item)
+            if item['start_time'] <= _current_time and _current_time < item['end_time']:
+                #print(item['is_drive'])
+                g_is_drive_times = g_config_dic['ope_time_' + str(item['id'])]
+
+        logger("現在の時間＝" + str(_current_time))
+        logger("運用時間帯か？＝" + str(g_is_drive_times))
+        #break
+        #実行時間
+        await asyncio.sleep(3)
 
 #######################################################
 # データから最も値がかたまっている値群の平均値を求める関数
 #######################################################
 def get_clustered_values_average(data):
-    logger("get_clustered_values_average start")
+    #logger("get_clustered_values_average start")
     
     try:
         if len(data) == 0:
@@ -139,132 +239,223 @@ def get_clustered_values_average(data):
         logger(str(e))
         avg = 0
     
-    logger("get_clustered_values_average end")
+    #logger("get_clustered_values_average end")
 
     return avg
 
 #######################################################
 # 水門開ける
 #######################################################
-def wopen(sec=10):
-
+async def wopen(sec=10):
+    global g_open_close
+    global g_count_down_since_opening
     try:
+        if g_open_close == OPENCLOSE_OPEN:
+            return
+        g_open_close = OPENCLOSE_OPEN
+        
+        #(_today,_current_time) = getDateTime(utime.localtime())
+        #show_status_opening(_current_time)
+
         logger('watergate open')
         M1.low()
         M2.high()
         
         logger('open sec=' + str(sec))
-        utime.sleep(sec)
+        #utime.sleep(sec)
+        await asyncio.sleep(sec)
+
         M1.low()
         M2.low()
         
 
         logger('watergate stop')
-        utime.sleep(5)
+        #utime.sleep(5)
+        await asyncio.sleep(5)
 
     except Exception as e:
         logger(e)
 
-    return "Open OK"
+    return
 
 #######################################################
 # 水門閉じる
 #######################################################
-def wclose(sec=20):
-
+async def wclose(sec=20):
+    global g_open_close
+    global g_count_down_since_opening
 
     try:
+        if g_open_close == OPENCLOSE_CLOSE:
+            return
+        g_open_close = OPENCLOSE_CLOSE
+        g_count_down_since_opening = 120
+
+        #(_today,_current_time) = getDateTime(utime.localtime())
+        #show_status_closing(_current_time)
+
         logger('watergate close')
         M1.high()
         M2.low()
         logger('close sec=' + str(sec))
-        utime.sleep(sec)
+        #utime.sleep(sec)
+        await asyncio.sleep(sec)
+
 
         logger('watergate stop')
 
         M1.low()
         M2.low()
-
-        utime.sleep(5)
+        #utime.sleep(5)
+        await asyncio.sleep(5)
 
 
     except Exception as e:
         logger(str(e))
 
-    return "Close OK"
+    return
 
 #######################################################
 # 距離測定関数定義
 #######################################################
-def ultra():
-    global TRIG
-    global ECHO
-    
+async def ultra():
+    global g_water_level
+    #logger('ultra start')
+    #無限ループ
+    while True:
+        _values = []
 
-    logger('ultra start')
-    _values = []
+        #データから最も値がかたまっている値群の平均値を求める
+        for i in range(3):
+            #logger('loop start')
 
-    #データから最も値がかたまっている値群の平均値を求める
-    for i in range(3):
-        logger('loop start')
+            TRIG.low()
+            utime.sleep_us(10) #2 10
+            TRIG.high()
+            utime.sleep_us(2) #5 2
+            TRIG.low()
+            k = 0
+            while ECHO.value() == 0:
+                signaloff = utime.ticks_us()
+                k += 1
+                if k > 10000:
+                    logger('計測エラー1')
+                    #ECHO.init(Pin.IN, Pin.PULL_DOWN)
+                    #TRIG.init(Pin.OUT)
 
-        TRIG.low()
-        utime.sleep_us(2) #2 10
-        TRIG.high()
-        utime.sleep_us(10) #5 2
-        TRIG.low()
-        k = 0
-        signaloff = 0.0
-        while ECHO.value() == 0:
-            signaloff = utime.ticks_us()
-            k += 1
-            if k > 10000:
-                logger('計測エラー1')
-                #ECHO.init(Pin.IN, Pin.PULL_DOWN)
-                #TRIG.init(Pin.OUT)
-                signaloff = 0.0
-
-                break
-        k = 0
-        signalon = 0.0
-        while ECHO.value() == 1:
-            signalon = utime.ticks_us()
-            k += 1
-            if k > 10000:
-                logger('計測エラー2')
-                #ECHO.init(Pin.IN, Pin.PULL_DOWN)
-                #TRIG.init(Pin.OUT)
-                signalon = 0.0
-                break
+                    break
+            k = 0
+            while ECHO.value() == 1:
+                signalon = utime.ticks_us()
+                k += 1
+                if k > 10000:
+                    logger('計測エラー2')
+                    #ECHO.init(Pin.IN, Pin.PULL_DOWN)
+                    #TRIG.init(Pin.OUT)
+                    break
+                
+            #logger('signalon:' + str(signalon))
+            #logger('signaloff:' + str(signaloff))
             
-        logger('距離算出')
-        logger('signalon:' + str(signalon))
-        logger('signaloff:' + str(signaloff))
-        #timepassed = signalon - signaloff
-        timepassed = utime.ticks_diff(signalon, signaloff)
-        #logger('signalon:' + str(signalon))
-        #logger('signaloff:' + str(signaloff))
+            timepassed = signalon - signaloff
 
-        distance = round((timepassed * 0.0343) / 2,1)
-        distance_correction = g_config_dic['distance_correction']
-        water_level_correction_mm = g_config_dic['water_level_correction_mm']
+            distance = round((timepassed * 0.0343) / 2,1)
+            logger(str(i+1) + '回目測定 ' + str(distance) + "cm")
         
-        logger(str(i+1) + '回目測定 ' + str(distance + distance_correction) + "cm")
-        if distance > 0 and distance < 100:
-            _values.append(distance + distance_correction)
-        else:
-            _values.append(water_level_correction_mm)
+            _values.append(distance)
+        
+            #utime.sleep(3)
+            #ループ待ち
+            await asyncio.sleep(3)
             
-    
-        utime.sleep(5)
-        
-        
-    ret = get_clustered_values_average(_values)
-    logger("average is " + str(ret) + "cm")
-    logger('ultra end')
+        g_water_level = get_clustered_values_average(_values)
+        #ループ待ち
+        await asyncio.sleep(3)
 
-    logger(str(ret))
-    return ret
+#     logger("average is " + str(ret) + "cm")
+#     logger('ultra end')
+# 
+#     logger(str(ret))
+    #return ret
+#######################################################
+# Callback関数の定義
+#######################################################
+def on_rx(data):
+    global g_ble_ope_mode #log,menu,show,config
+    global g_ble_commands #config → xxxx=9999,save,destory,
+    print(data.strip())
+    #logger(data.strip())
+    #print("Data received: ", data)  # Print the received data
+    #global led_state  # Access the global variable led_state
+    if data.strip() == b'log':  # Check if the received data is "toggle"
+        logger('log mode')
+        g_ble_ope_mode = 'log'
+        #g_ble_ope_mode = {mode: 'log', time: utime.localtime()}
+    elif data.strip() == b'reset':  # Check if the received data is "toggle"
+        reset()
+        #g_ble_ope_mode = 'test'
+        #g_ble_ope_mode = {mode: 'menu', time: utime.localtime()}
+    elif data.strip() == b'self':  # Check if the received data is "toggle"
+        logger('self mode')
+        g_ble_ope_mode = 'self'
+        #g_ble_ope_mode = {mode: 'menu', time: utime.localtime()}
+    elif data.strip() == b'menu':  # Check if the received data is "toggle"
+        logger('menu mode')
+        g_ble_ope_mode = 'menu'
+        #g_ble_ope_mode = {mode: 'menu', time: utime.localtime()}
+    elif data.strip() == b'configure':  # Check if the received data is "toggle"
+        logger('configure mode')
+        g_ble_ope_mode = 'configure'
+        #print('summary show')
+        #g_ble_ope_mode = {mode: 'config', time: utime.localtime()}
+    #else if data.strip() == b'save':  # Check if the received data is "toggle"
+        #print('summary show')
+        #g_ble_ope_mode = 'save'
+    else:
+        if g_ble_ope_mode == 'configure' or g_ble_ope_mode == 'menu' or g_ble_ope_mode == 'test' or g_ble_ope_mode == 'self':
+            g_ble_commands.append({'mode': g_ble_ope_mode, 'command': data.strip(), 'timestamp': fromatDateTimeStr(utime.localtime())})
+
+
+
+
+#######################################################
+# ステータス表示
+#######################################################
+async def show_status_service():
+    while True:
+        await asyncio.sleep(g_config_dic["waiting_for_interval_sec"])
+        show_status()
+
+
+
+#######################################################
+# 自動運転モード
+#######################################################
+async def auto_drive():
+    global g_count_down_since_opening
+    while True:
+        await asyncio.sleep(g_config_dic["waiting_for_interval_sec"])
+        if g_ble_ope_mode == "auto":
+            g_count_down_since_opening -= 1
+            
+            #①時間の取得
+            (_today,_current_time) = getDateTime(utime.localtime())
+
+            logger("自動モード")
+
+            #④判定 運用時間帯かつ　水位が基準を下回る
+            if (g_count_down_since_opening <= 0) and g_is_drive_times and ((g_config_dic['water_level_correction_mm'] - g_water_level) < g_config_dic['open_closing_standards_mm']):
+                logger('watergate open')
+                await wopen(g_config_dic['open_time_sec'])
+
+            #⑤判定 運用時間帯以外かつ　水位が4を下回る
+            elif (g_count_down_since_opening <= 0) and (g_is_drive_times == False) and ((g_config_dic['water_level_correction_mm'] - g_water_level) < 4):
+                logger('watergate open2')
+                await wopen(g_config_dic['open_time_sec'])
+            else:
+                logger('watergate close')
+                await wclose(g_config_dic['close_time_sec'])
+
 
 #######################################################
 # 時間取得処理定義
@@ -329,206 +520,81 @@ def getDateTime(localTIme):
 
     return (_date,_current_time)
 
-# Define a callback function to handle received data
-#######################################################
-# Callback関数の定義
-#######################################################
-def on_rx(data):
-    global g_ble_ope_mode
-    #log,menu,show,config
-    global g_ble_commands
-    #config → xxxx=9999,save,destory,
-    print(data.strip())
-    #logger(data.strip())
-    #print("Data received: ", data)  # Print the received data
-    #global led_state  # Access the global variable led_state
-    if data.strip() == b'log':  # Check if the received data is "toggle"
-        logger('log mode')
-        g_ble_ope_mode = 'log'
-        #g_ble_ope_mode = {mode: 'log', time: utime.localtime()}
-    elif data.strip() == b'test':  # Check if the received data is "toggle"
-        logger('test mode')
-        g_ble_ope_mode = 'test'
-        #g_ble_ope_mode = {mode: 'menu', time: utime.localtime()}
-    elif data.strip() == b'self':  # Check if the received data is "toggle"
-        logger('self mode')
-        g_ble_ope_mode = 'self'
-        #g_ble_ope_mode = {mode: 'menu', time: utime.localtime()}
-    elif data.strip() == b'menu':  # Check if the received data is "toggle"
-        logger('menu mode')
-        g_ble_ope_mode = 'menu'
-        #g_ble_ope_mode = {mode: 'menu', time: utime.localtime()}
-    elif data.strip() == b'show':  # Check if the received data is "toggle"
-        logger('show mode')
-        g_ble_ope_mode = 'show'
-        #g_ble_ope_mode = {mode: 'show', time: utime.localtime()}
-    elif data.strip() == b'configure':  # Check if the received data is "toggle"
-        logger('configure mode')
-        g_ble_ope_mode = 'configure'
-        #print('summary show')
-        #g_ble_ope_mode = {mode: 'config', time: utime.localtime()}
-    #else if data.strip() == b'save':  # Check if the received data is "toggle"
-        #print('summary show')
-        #g_ble_ope_mode = 'save'
-    else:
-        if g_ble_ope_mode == 'configure' or g_ble_ope_mode == 'menu' or g_ble_ope_mode == 'test' or g_ble_ope_mode == 'self':
-            g_ble_commands.append({'mode': g_ble_ope_mode, 'command': data.strip(), 'timestamp': fromatDateTimeStr(utime.localtime())})
-
-#######################################################
-# 状態表示定義
-#######################################################
-def show_status(level,openClose,is_drive):
-    global g_config_dic
-    
-    if BLE_SP.is_connected():
-        formated_msg = '現在水位' + str(round(g_config_dic['water_level_correction_mm'] - level,1)) + 'cm ' \
-               + '閾値' + str(g_config_dic['open_closing_standards_mm']) + 'cm' \
-               + ' ' + ('自動' if g_ble_ope_mode != 'self' else '手動') \
-               + ' ' + ('開門' if openClose == OPENCLOSE_OPEN else '閉門') \
-               + ' ' + ('運転時間帯' if is_drive==True else '停止時間帯') 
-        BLE_SP.send(formated_msg)
 
 #######################################################
 # メイン処理定義
 #######################################################
-def main():
+async def main():
 
     #初期処理
     logger('start')
     
     #初期設定
+    global g_water_level
+    global g_is_drive_times
+
+
     global g_ble_ope_mode
     global g_ble_commands
     global g_config_dic
     global g_ope_time_dic
     global g_count_down_since_opening
 
-
-    #RTCから時刻取得
-    logger('rtc connect')
-    _i2c_rtc = SoftI2C(scl = Pin(1),sda = Pin(0),freq = 100000)
-    _result = SoftI2C.scan(_i2c_rtc)
-    _rtc = DS1307(_i2c_rtc)
-
-    #時間設定
-    #utime.localtime()
-    logger('datetime setting')
-    RTC().datetime(_rtc.datetime())
-
-    logger('watergate close')
+    #RTCの設定
+    set_rtc()
 
     #門を一度完全に閉じる
-    wclose(g_config_dic['close_time_sec'])
-    _openClose = OPENCLOSE_CLOSE #1
+    await wclose(g_config_dic['close_time_sec'])
+    g_count_down_since_opening = 0
+
+    #BLE通信
+    BLE_SP.on_write(on_rx)    
     
     #初期設定情報の読み込み
-    logger('config load')
-    try:
+    load_config()
 
-        # 設定ファイルの読み込み
-        with open(CONFIG_JSON_FILE, 'r') as f:
-            g_config_dic = json.load(f)
+    #水位測定
+    asyncio.create_task(ultra())
 
-    except OSError:  # ファイルが存在しない場合のエラーハンドリング
-        # 設定ファイルの書き込み
-        with open(CONFIG_JSON_FILE, 'w') as f:
-            json.dump(g_config_dic,f, separators=(',', ': '))
+    #運用時間チェック
+    asyncio.create_task(check_drive_times())
 
-    try:
-
-        # 運用時間ファイルの読み込み
-        with open(OPE_TIME_JSON_FILE, 'r') as f:
-            g_ope_time_dic = json.load(f)
-
-    except OSError:  # ファイルが存在しない場合のエラーハンドリング
-
-        # 運用時間ファイルの書き込み
-        with open(OPE_TIME_JSON_FILE, 'w') as f:
-            json.dump(g_ope_time_dic,f, separators=(',', ': '))
-
-    #ループ待ち時間
-    _wfis = g_config_dic["waiting_for_interval_sec"]
-    #水位
-    _level = 0.0
-    #手動自動運転
-    _is_drive = False
-    
-    #自動手動スイッチ情報退避
-    #_back_auto_self = AUTOSELF.value()
-
-    
+    #自動運転処理
+    asyncio.create_task(auto_drive())
+    #ステータスをブルートースで送信
+    asyncio.create_task(show_status_service())
 
 
     #無限ループ
     while True:
-        #①時間の取得
-        (_today,_current_time) = getDateTime(utime.localtime())
+            
+        #ループ待ち
+        await asyncio.sleep(g_config_dic["waiting_for_interval_sec"])
+        logger("g_ble_ope_mode=" + str(g_ble_ope_mode))
+        logger("g_water_level=" + str(g_water_level))
+        logger("g_count_down_since_opening=" + str(g_count_down_since_opening)) 
+        if g_water_level == None:
+            continue
+        
 
-        #②水位の測定
-        try:
-            _level = ultra()
-        except Exception as e:
-            logger(str(e))
-            #_level = 0
-
-        #③運用時間帯チェック
-        _is_drive = False
-        for item in g_ope_time_dic:
-            #print(item)
-            if item['start_time'] <= _current_time and _current_time < item['end_time']:
-                #print(item['is_drive'])
-                _is_drive = g_config_dic['ope_time_' + str(item['id'])]
-                print("現在の時間＝" + str(_current_time))
-                print("運用時間帯か？＝" + str(_is_drive))
-                #break
-
-        #print("test=" + FORCE_OPEN)
-
-         #強制オープンの場合
+          #強制オープンの場合
         if FORCE_OPEN.value() == FORCE_OPEN_ON:
-            g_count_down_since_opening = 0
-            logger('FORCE_OPEN_ON')
-            g_ble_ope_mode = "self"
-            #show_status(_level,OPENCLOSE_OPEN,_is_drive)
-            show_status(_level,_openClose,_is_drive)
-            if _openClose != OPENCLOSE_OPEN:
-                _openClose = OPENCLOSE_OPEN #1
-                show_status(_level,_openClose,_is_drive)
-                wopen(g_config_dic['open_time_sec'])
-
-            g_ble_ope_mode = "show"
+            g_ble_ope_mode = "force"
+            g_ble_commands = []
+            await wopen(g_config_dic['open_time_sec'])
             continue
         
         #強制クローズの場合
         if FORCE_CLOSE.value() == FORCE_CLOSE_ON:
-            g_count_down_since_opening = 0
-            logger('FORCE_CLOSE_ON')
-            g_ble_ope_mode = "self"
-            #show_status(_level,OPENCLOSE_CLOSE,_is_drive)
-            show_status(_level,_openClose,_is_drive)
-            if _openClose != OPENCLOSE_CLOSE:
-                _openClose = OPENCLOSE_CLOSE #1
-                show_status(_level,_openClose,_is_drive)
-                wclose(g_config_dic['close_time_sec'])
-
-            g_ble_ope_mode = "show"
+            g_ble_ope_mode = "force"
+            g_ble_commands = []
+            await wclose(g_config_dic['close_time_sec'])
             continue
         
-        #運転モード
-        #if _is_drive != True:
-        #    continue
-        #if g_ble_ope_mode == "self"
-        #    g_ble_ope_mode = "show"
-        
-
-         #①BLE通信
-        if BLE_SP.is_connected():  # Check if a BLE connection is established
-            logger('ble setting')
-            BLE_SP.on_write(on_rx)  # Set the callback function for data reception
 
         ## Bleコマンド処理
-        logger('モード=' + str(g_ble_ope_mode))
-        logger('コマンド=' + str(g_ble_commands))
+        #logger('モード=' + str(g_ble_ope_mode))
+        #logger('コマンド=' + str(g_ble_commands))
 
         #コマンドがある場合
         if len(g_ble_commands) > 0:
@@ -542,6 +608,7 @@ def main():
                 logger("------")
                 #処理する
                 if str(command['mode']) == 'configure':
+                    g_count_down_since_opening = 0
                     #処理をする
                     if command['command'] == b'save':
                         # 設定ファイルの書き込み
@@ -564,131 +631,42 @@ def main():
                     #処理をする
                     if command['command'] == b'open':
                         logger("open command  run")
-                        show_status(_level,_openClose,_is_drive)
-                        if _openClose != OPENCLOSE_OPEN:
-                            _openClose = OPENCLOSE_OPEN #1
-                            show_status(_level,_openClose,_is_drive)
-                            wopen(g_config_dic['open_time_sec'])
+                        await wopen(g_config_dic['open_time_sec'])
                     elif command['command'] == b'close':
                         logger("close command  run")
-                        show_status(_level,_openClose,_is_drive)
-                        if _openClose != OPENCLOSE_CLOSE:
-                            _openClose = OPENCLOSE_CLOSE #1
-                            show_status(_level,_openClose,_is_drive)
-                            wclose(g_config_dic['close_time_sec'])
+                        await wclose(g_config_dic['close_time_sec'])
 
                 elif str(command['mode']) == 'menu':
                     None
 
                 #処理したら、行削除
                 g_ble_commands.remove(command)
+                g_count_down_since_opening = 0
 
+        elif g_ble_ope_mode == "auto":
+            pass
         elif g_ble_ope_mode == "test":
+            await wopen(g_config_dic['open_time_sec'])
+            await wclose(g_config_dic['close_time_sec'])
             g_count_down_since_opening = 0
-            show_status(_level,_openClose,_is_drive)
-            if _openClose != OPENCLOSE_OPEN:
-                _openClose = OPENCLOSE_OPEN #1
-                show_status(_level,_openClose,_is_drive)
-                wopen(g_config_dic['open_time_sec'])
-            if _openClose != OPENCLOSE_CLOSE:
-                _openClose = OPENCLOSE_CLOSE #1
-                show_status(_level,_openClose,_is_drive)
-                wclose(g_config_dic['close_time_sec'])
-
-            g_ble_ope_mode = "show"
-        elif g_ble_ope_mode == "show":
-            g_count_down_since_opening = 0
-            show_status(_level,_openClose,_is_drive)
-#             if BLE_SP.is_connected():
-#                 formated_msg = '現在水位' + str(round(g_config_dic['water_level_correction_mm'] - _level,1)) + 'cm ' \
-#                        + '閾値' + str(g_config_dic['open_closing_standards_mm']) + 'cm' \
-#                        + ' ' + ('自動' if AUTOSELF.value() == AUTOSELF_AUTO else '手動') \
-#                        + ' ' + ('開門' if _openClose == OPENCLOSE_OPEN else '閉門') \
-#                        + ' ' + ('運転時間帯' if _is_drive==True else '停止時間帯') 
-#                 BLE_SP.send(formated_msg)
-
-
-        #自動手動スイッチの切替判断 (物理スイッチを変更した場合は、ソフトセルフは解除される)
-#         if AUTOSELF.value() != _back_auto_self:
-#             if AUTOSELF.value() == AUTOSELF_AUTO:
-#                 g_ble_ope_mode = 'show'
-#             else:
-#                 g_ble_ope_mode = 'self'
-# 
-#             #直近の情報保持
-#             _back_auto_self = AUTOSELF.value()
-
-
-
-        #自動時の繰り返し処理
-        if g_ble_ope_mode != 'self' :
-            
-            #①時間の取得
-            (_today,_current_time) = getDateTime(utime.localtime())
-
-            logger("自動モード")
-
-
-#             logger('現在水位:' + str(round(g_config_dic['water_level_correction_mm'] - _level,1)))
-#             logger('開門基準:' + str(g_config_dic['open_closing_standards_mm']))
-#             logger(' 運用時間' if _is_drive==True else ' 停止時間')
-#             
-            #④判定 運用時間帯かつ　水位が基準を下回る
-            if g_count_down_since_opening <= 0 and _is_drive and ((g_config_dic['water_level_correction_mm'] - _level) < g_config_dic['open_closing_standards_mm']):
-                logger('watergate open')
-                g_count_down_since_opening = 30
-                show_status(_level,_openClose,_is_drive)
-                if _openClose != OPENCLOSE_OPEN:
-                    _openClose = OPENCLOSE_OPEN #0
-                    show_status(_level,_openClose,_is_drive)
-                    wopen(g_config_dic['open_time_sec'])
-            else:
-                logger('watergate close')
-                g_count_down_since_opening -= 1
-                show_status(_level,_openClose,_is_drive)
-                if _openClose != OPENCLOSE_CLOSE:
-                    _openClose = OPENCLOSE_CLOSE #1
-                    show_status(_level,_openClose,_is_drive)
-                    wclose(g_config_dic['close_time_sec'])
-
-
-#         #手動時の繰り返し処理
-#         if g_ble_ope_mode == 'self':
-#             #①時間の取得
-#             (_today,_current_time) = getDateTime(utime.localtime())
-# 
-#             logger("手動モード")
-# 
-#             if SELFOPENCLOSE.value() == OPENCLOSE_OPEN:
-#                 logger('watergate open')
-#                 if _openClose != OPENCLOSE_OPEN:
-#                     _openClose = OPENCLOSE_OPEN #0
-#                     show_status(_level,_openClose,_is_drive)
-#                     wopen(g_config_dic['open_time_sec'])
-#             else:
-#                 logger('watergate close')
-#                 if _openClose != OPENCLOSE_CLOSE:
-#                     _openClose = OPENCLOSE_CLOSE #1
-#                     show_status(_level,_openClose,_is_drive)
-#                     wclose(g_config_dic['close_time_sec'])
-            logger('g_count_down_since_opening =' + str(g_count_down_since_opening))
-
-        #ループ待ち
-        utime.sleep(_wfis)
-
-
+            g_ble_ope_mode = "auto"
+        else:
+            g_ble_ope_mode = "auto"
 
 
 #######################################################
 # 水門開閉管理 処理実行
 #######################################################
 try:
-    #無限ループ
-    while True:
-        main()
-
+    #メイン処理
+    asyncio.run(main())
 except Exception as e:
     logger(str(e))
+finally:
+    #終了してきた場合は、リセットする
+    utime.sleep(5)
+    reset()
+
 
 
 

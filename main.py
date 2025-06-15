@@ -7,6 +7,7 @@ import utime
 import json
 import bluetooth
 from ble_simple_peripheral import BLESimplePeripheral
+import uos
 
 # BLE モード定数
 BLE_MODE_LOG = 'log'
@@ -37,6 +38,8 @@ BLE_SP = BLESimplePeripheral(BLE)
 CONFIG_JSON_FILE = '/config.json'
 OPE_TIME_JSON_FILE = '/operation_time.json'
 LOG_FILE = '/operation.log'
+LOG_DIR = '/log'
+LOG_RETAIN_DAYS = 7  # 保存日数
 
 # 状態定数
 OPENCLOSE_OPEN = 0
@@ -100,17 +103,73 @@ g_ope_time_dic = [
     for i in range(8)
 ]
 
+def ensure_log_dir():
+    if LOG_DIR not in uos.listdir('/'):
+        try:
+            uos.mkdir(LOG_DIR)
+        except:
+            pass
+
+def get_log_filename():
+    t = utime.localtime()
+    return f"{LOG_DIR}/log_{t[0]:04d}{t[1]:02d}{t[2]:02d}.txt"
+
+def delete_old_logs():
+    try:
+        files = uos.listdir(LOG_DIR)
+        now = utime.time()
+
+        for fname in files:
+            if fname.startswith("log_") and fname.endswith(".txt"):
+                try:
+                    y = int(fname[4:8])
+                    m = int(fname[8:10])
+                    d = int(fname[10:12])
+                    log_time = utime.mktime((y, m, d, 0, 0, 0, 0, 0))
+                    if now - log_time > LOG_RETAIN_DAYS * 86400:
+                        uos.remove(f"{LOG_DIR}/{fname}")
+                        print(f"削除: {fname}")
+                except Exception as e:
+                    print("ログファイル日付解析エラー:", fname, e)
+    except Exception as e:
+        print("ログ削除処理エラー:", e)
+
+
 # ログ出力
+# def logger(msg):
+#     try:
+#         _dateTime = fromatDateTimeStr(utime.localtime())
+#         formated_msg = f"{_dateTime} {msg}\n"
+#         if g_ble_ope_mode == BLE_MODE_LOG:
+#             BLE_SP.send(formated_msg.strip())
+#             
+#         with open(LOG_FILE, 'a') as f:  # ファイルを追記モードで開く
+#             f.write(formated_msg.strip())    # 追記実行（文字列で）※改行付
+#             #print("Append:", data)  # 追記データ表示
+#             
+#         print(formated_msg.strip())
+#     except Exception as e:
+#         print('logger error:' + str(e))
+# 新しい logger
 def logger(msg):
     try:
         _dateTime = fromatDateTimeStr(utime.localtime())
         formated_msg = f"{_dateTime} {msg}\n"
+
+        # BLEに送信
         if g_ble_ope_mode == BLE_MODE_LOG:
             BLE_SP.send(formated_msg.strip())
+
+        ensure_log_dir()
+        delete_old_logs()
+
+        # 日付ごとのファイルに書き出す
+        with open(get_log_filename(), 'a') as f:
+            f.write(formated_msg)
+
         print(formated_msg.strip())
     except Exception as e:
         print('logger error:' + str(e))
-
 
 # RTC設定
 def set_rtc():
@@ -152,7 +211,9 @@ async def check_drive_times():
 # 水位測定
 async def ultra():
     global g_water_level
+    logger(f"測定開始")
     while True:
+        
         _values = []
         for _ in range(3):
             TRIG.low()
@@ -178,6 +239,7 @@ async def ultra():
             _values.append(distance)
             await asyncio.sleep(3)
         g_water_level = get_clustered_values_average(_values)
+        logger(f"測定(g_water_level): {g_water_level}")
         await asyncio.sleep(3)
 
 # クラスタ化平均
